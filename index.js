@@ -1,57 +1,98 @@
 import express from "express";
 import cors from "cors";
+import { getDb } from "./db.js";
 
 const app = express();
+
+/* ================================
+   Middleware
+================================ */
 app.use(cors());
 app.use(express.json());
 
-app.get("/", (req, res) => res.send("TaskAgent backend is alive ✅"));
+/* ================================
+   Health Check
+================================ */
+app.get("/", (req, res) => {
+  res.send("TaskAgent backend is alive ✅");
+});
 
-// ---- In-memory "database" ----
-let nextId = 1;
-const tasks = []; // each: { id, title, done, createdAt }
+/* ================================
+   SQLite-backed Tools
+================================ */
 
-// ---- Tools (functions the agent can call) ----
-function createTask(title) {
-  const task = {
-    id: nextId++,
+// Create a new task
+async function createTask(title) {
+  const db = await getDb();
+  const createdAt = new Date().toISOString();
+
+  const result = await db.run(
+    "INSERT INTO tasks (title, done, createdAt) VALUES (?, 0, ?)",
+    [title.trim(), createdAt],
+  );
+
+  return {
+    id: result.lastID,
     title: title.trim(),
     done: false,
-    createdAt: new Date().toISOString(),
+    createdAt,
   };
-  tasks.push(task);
-  return task;
 }
 
-function listTasks() {
-  return tasks;
+// List all tasks
+async function listTasks() {
+  const db = await getDb();
+  const rows = await db.all(
+    "SELECT id, title, done, createdAt FROM tasks ORDER BY id DESC",
+  );
+
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    done: Boolean(row.done),
+    createdAt: row.createdAt,
+  }));
 }
 
-function completeTask(id) {
-  const task = tasks.find((t) => t.id === id);
+// Complete a task
+async function completeTask(id) {
+  const db = await getDb();
+
+  const task = await db.get(
+    "SELECT id, title, done, createdAt FROM tasks WHERE id = ?",
+    [id],
+  );
+
   if (!task) return null;
-  task.done = true;
-  return task;
+
+  await db.run("UPDATE tasks SET done = 1 WHERE id = ?", [id]);
+
+  return {
+    id: task.id,
+    title: task.title,
+    done: true,
+    createdAt: task.createdAt,
+  };
 }
 
-// ---- Intent router (turn text -> tool call) ----
+/* ================================
+   Intent Router (Brain)
+================================ */
 function routeIntent(message) {
   const m = message.trim();
 
-  // "add task buy milk" | "create task buy milk" | "todo buy milk"
-  const addMatch =
-    m.match(/^(add|create)\s+task\s+(.+)$/i) || m.match(/^todo\s+(.+)$/i);
+  // add task buy milk
+  const addMatch = m.match(/^(add|create)\s+task\s+(.+)$/i);
   if (addMatch) {
-    const title = addMatch[2] || addMatch[1];
-    return { intent: "create_task", title };
+    return { intent: "create_task", title: addMatch[2] };
   }
 
-  // "list tasks" | "show tasks"
+  // list tasks
   if (/^(list|show)\s+tasks$/i.test(m)) {
     return { intent: "list_tasks" };
   }
 
-  // "complete 2" | "done 2"
+  // complete 1
   const completeMatch = m.match(/^(complete|done)\s+(\d+)$/i);
   if (completeMatch) {
     return { intent: "complete_task", id: Number(completeMatch[2]) };
@@ -60,19 +101,24 @@ function routeIntent(message) {
   return { intent: "unknown" };
 }
 
-// ---- Helper for nice output ----
-function formatTasks(tsk) {
-  if (tsk.length === 0) return "No tasks yet.";
-  return tsk
+/* ================================
+   Helpers
+================================ */
+function formatTasks(tasks) {
+  if (tasks.length === 0) return "No tasks yet.";
+
+  return tasks
     .map((t) => `${t.done ? "✅" : "⬜"} [${t.id}] ${t.title}`)
     .join("\n");
 }
 
-// ---- Updated agent endpoint ----
-app.post("/api/chat", (req, res) => {
+/* ================================
+   Agent API Endpoint
+================================ */
+app.post("/api/chat", async (req, res) => {
   const { message } = req.body;
 
-  if (typeof message !== "string" || message.trim().length === 0) {
+  if (typeof message !== "string" || message.trim() === "") {
     return res
       .status(400)
       .json({ error: "message must be a non-empty string" });
@@ -81,42 +127,49 @@ app.post("/api/chat", (req, res) => {
   const action = routeIntent(message);
 
   if (action.intent === "create_task") {
-    const task = createTask(action.title);
+    const task = await createTask(action.title);
+    const tasks = await listTasks();
+
     return res.json({
       agent: "TaskAgent",
-      intent: action.intent,
+      intent: "create_task",
       reply: `Created task ✅: [${task.id}] ${task.title}`,
-      tasks: listTasks(),
+      tasks,
     });
   }
 
   if (action.intent === "list_tasks") {
+    const tasks = await listTasks();
+
     return res.json({
       agent: "TaskAgent",
-      intent: action.intent,
-      reply: formatTasks(listTasks()),
-      tasks: listTasks(),
+      intent: "list_tasks",
+      reply: formatTasks(tasks),
+      tasks,
     });
   }
 
   if (action.intent === "complete_task") {
-    const updated = completeTask(action.id);
-    if (!updated) {
-      return res.status(404).json({
+    const task = await completeTask(action.id);
+
+    if (!task) {
+      return res.json({
         agent: "TaskAgent",
-        intent: action.intent,
+        intent: "complete_task",
         reply: `No task found with id ${action.id}`,
       });
     }
+
+    const tasks = await listTasks();
+
     return res.json({
       agent: "TaskAgent",
-      intent: action.intent,
-      reply: `Completed ✅: [${updated.id}] ${updated.title}`,
-      tasks: listTasks(),
+      intent: "complete_task",
+      reply: `Completed ✅: [${task.id}] ${task.title}`,
+      tasks,
     });
   }
 
-  // Unknown intent: teach user what to do
   return res.json({
     agent: "TaskAgent",
     intent: "unknown",
@@ -128,9 +181,10 @@ app.post("/api/chat", (req, res) => {
   });
 });
 
+/* ================================
+   Start Server (Render-compatible)
+================================ */
 const PORT = process.env.PORT || 3000;
-
-// bind 0.0.0.0 is safe on Render
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on ${PORT}`);
 });
