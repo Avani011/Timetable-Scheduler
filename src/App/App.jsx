@@ -1,4 +1,5 @@
 import LoginPage from "../pages/LoginPage";
+import "../styles/global.css";
 
 function App() {
   return (
